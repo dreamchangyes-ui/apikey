@@ -1,0 +1,276 @@
+// Prisma schema for Free LLM Hub & AI API Key Management System
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum Role {
+  ADMIN
+  OPERATOR
+  VIEWER
+}
+
+enum ProviderStatus {
+  ACTIVE
+  INACTIVE
+  DEGRADED
+  MAINTENANCE
+}
+
+enum AuthType {
+  BEARER_TOKEN
+  API_KEY_HEADER
+  QUERY_PARAM
+}
+
+enum KeyStatus {
+  ACTIVE
+  RATE_LIMITED
+  ERROR
+  DISABLED
+  COOLDOWN
+}
+
+enum KeyRotationStrategy {
+  ROUND_ROBIN
+  LEAST_USED
+  RANDOM
+  PRIORITY
+  FAILOVER
+}
+
+enum ErrorSeverity {
+  INFO
+  WARNING
+  ERROR
+  CRITICAL
+}
+
+// 1. User Model with RBAC
+model User {
+  id            String          @id @default(cuid())
+  email         String          @unique
+  name          String
+  passwordHash  String
+  role          Role            @default(VIEWER)
+  avatar        String?
+  createdAt     DateTime        @default(now())
+  updatedAt     DateTime        @updatedAt
+
+  clientKeys    ClientApiKey[]
+  auditLogs     AuditLog[]
+
+  @@map("users")
+}
+
+// 2. Provider Model
+model Provider {
+  id              String          @id @default(cuid())
+  slug            String          @unique
+  name            String
+  logo            String
+  baseUrl         String
+  docsUrl         String
+  status          ProviderStatus  @default(ACTIVE)
+  authType        AuthType        @default(BEARER_TOKEN)
+  rpmLimit        Int             @default(60)
+  tpmLimit        Int             @default(40000)
+  rpdLimit        Int             @default(1000)
+  freeTier        String?
+  notes           String?
+  createdAt       DateTime        @default(now())
+  updatedAt       DateTime        @updatedAt
+
+  models          ProviderModel[]
+  apiKeys         ApiKey[]
+  usageLogs       UsageLog[]
+  errorLogs       ErrorLog[]
+  healthChecks    HealthCheck[]
+
+  @@map("providers")
+}
+
+// 3. Provider Model Details
+model ProviderModel {
+  id              String          @id @default(cuid())
+  providerId      String
+  name            String
+  modelId         String          // e.g. "gemini-2.5-flash", "llama-3.3-70b-versatile"
+  contextLength   Int             @default(32768)
+  inputLimit      Int             @default(8192)
+  outputLimit     Int             @default(4096)
+  isFree          Boolean         @default(true)
+  status          String          @default("active")
+  requestsCount   Int             @default(0)
+  tokensCount     BigInt          @default(0)
+  createdAt       DateTime        @default(now())
+  updatedAt       DateTime        @updatedAt
+
+  provider        Provider        @relation(fields: [providerId], references: [id], onDelete: Cascade)
+  usageLogs       UsageLog[]
+
+  @@unique([providerId, modelId])
+  @@map("provider_models")
+}
+
+// 4. API Key Pool & Storage (Encrypted at Rest)
+model ApiKey {
+  id              String          @id @default(cuid())
+  providerId      String
+  label           String          @default("Default Key")
+  keyHash         String          // Hash for lookup/duplication check
+  encryptedKey    String          // Encrypted secret key payload (AES-256-GCM)
+  maskedKey       String          // e.g. "sk-••••••••••••••••91ab"
+  status          KeyStatus       @default(ACTIVE)
+  priority        Int             @default(1)
+  failCount       Int             @default(0)
+  requestsCount   Int             @default(0)
+  tokensCount     BigInt          @default(0)
+  quotaTotal      Int?            // e.g. 500000 daily
+  quotaUsed       Int             @default(0)
+  lastUsedAt      DateTime?
+  lastError       String?
+  cooldownUntil   DateTime?
+  createdAt       DateTime        @default(now())
+  updatedAt       DateTime        @updatedAt
+
+  provider        Provider        @relation(fields: [providerId], references: [id], onDelete: Cascade)
+  usageLogs       UsageLog[]
+  errorLogs       ErrorLog[]
+
+  @@index([providerId, status])
+  @@map("api_keys")
+}
+
+// 5. Client API Keys (Issued to internal services/users)
+model ClientApiKey {
+  id              String          @id @default(cuid())
+  userId          String?
+  name            String          // e.g. "Staging Service", "Analytics Bot"
+  keyPrefix       String          // "fk_live_..."
+  keyHash         String          @unique
+  status          String          @default("active") // "active", "revoked", "expired"
+  reqLimitDaily   Int             @default(5000)
+  reqUsedDaily    Int             @default(0)
+  tokenLimitDaily Int             @default(500000)
+  tokenUsedDaily  Int             @default(0)
+  allowedModels   String[]        @default(["*"]) // Wildcard or specific model IDs
+  expiresAt       DateTime?
+  lastUsedAt      DateTime?
+  createdAt       DateTime        @default(now())
+  updatedAt       DateTime        @updatedAt
+
+  user            User?           @relation(fields: [userId], references: [id], onDelete: SetNull)
+  usageLogs       UsageLog[]
+
+  @@map("client_api_keys")
+}
+
+// 6. Unified Usage Logs
+model UsageLog {
+  id              String          @id @default(cuid())
+  requestId       String          @unique // e.g. "req_cmpl_..."
+  timestamp       DateTime        @default(now())
+  clientKeyId     String?
+  providerId      String
+  modelId         String
+  apiKeyId        String?
+  requestPreview  String?         // Short masked prompt snippet
+  responseStatus  Int             @default(200)
+  inputTokens     Int             @default(0)
+  outputTokens    Int             @default(0)
+  totalTokens     Int             @default(0)
+  latencyMs       Int             @default(0)
+  costEstimated   Float           @default(0.0)
+  error           String?
+  ipAddress       String?
+  userAgent       String?
+
+  clientKey       ClientApiKey?   @relation(fields: [clientKeyId], references: [id], onDelete: SetNull)
+  provider        Provider        @relation(fields: [providerId], references: [id], onDelete: Cascade)
+  model           ProviderModel?  @relation(fields: [modelId], references: [id], onDelete: SetNull)
+  apiKey          ApiKey?         @relation(fields: [apiKeyId], references: [id], onDelete: SetNull)
+
+  @@index([timestamp])
+  @@index([providerId, responseStatus])
+  @@map("usage_logs")
+}
+
+// 7. Error Monitoring Logs
+model ErrorLog {
+  id              String          @id @default(cuid())
+  errorType       String          // "Rate Limit", "Invalid API Key", "Provider Offline", "Timeout", "Model Not Found", "Quota Exceeded"
+  providerId      String?
+  apiKeyId        String?
+  statusCode      Int             @default(500)
+  message         String
+  count           Int             @default(1)
+  lastOccurredAt  DateTime        @default(now())
+  isResolved      Boolean         @default(false)
+  autoRetried     Boolean         @default(true)
+  cooldownTriggered Boolean       @default(false)
+
+  provider        Provider?       @relation(fields: [providerId], references: [id], onDelete: Cascade)
+  apiKey          ApiKey?         @relation(fields: [apiKeyId], references: [id], onDelete: SetNull)
+
+  @@map("error_logs")
+}
+
+// 8. Provider Health Checks
+model HealthCheck {
+  id              String          @id @default(cuid())
+  providerId      String
+  status          String          // "ONLINE", "RATE_LIMITED", "OFFLINE"
+  latencyMs       Int             @default(0)
+  successRate     Float           @default(100.0)
+  errorRate       Float           @default(0.0)
+  activeKeys      Int             @default(1)
+  failedKeys      Int             @default(0)
+  checkedAt       DateTime        @default(now())
+
+  provider        Provider        @relation(fields: [providerId], references: [id], onDelete: Cascade)
+
+  @@map("health_checks")
+}
+
+// 9. Audit Logs (Security Tracking)
+model AuditLog {
+  id              String          @id @default(cuid())
+  userId          String?
+  action          String          // "CREATE_API_KEY", "ROTATE_KEY", "CHANGE_SETTING", etc.
+  targetType      String          // "Provider", "ApiKey", "ClientKey", "Setting"
+  targetId        String?
+  details         String?
+  ipAddress       String?
+  createdAt       DateTime        @default(now())
+
+  user            User?           @relation(fields: [userId], references: [id], onDelete: SetNull)
+
+  @@map("audit_logs")
+}
+
+// 10. Rate Limiting Table
+model RateLimit {
+  id              String          @id @default(cuid())
+  key             String          @unique // e.g. "ip:127.0.0.1" or "client:fk_live_..."
+  currentCount    Int             @default(0)
+  resetAt         DateTime
+
+  @@map("rate_limits")
+}
+
+// 11. System Settings
+model SystemSetting {
+  id              String          @id @default(cuid())
+  key             String          @unique
+  value           String
+  description     String?
+  updatedAt       DateTime        @updatedAt
+
+  @@map("system_settings")
+}
